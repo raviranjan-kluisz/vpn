@@ -88,6 +88,7 @@ password = xxxx
 set-dns = 0
 pppd-use-peerdns = 0
 set-routes = 0
+pppd-ifname = ppp-vpn-name
 ```
 
 Important:
@@ -98,11 +99,84 @@ set-routes = 0
 
 prevents VPNs from fighting over routes.
 
+Use a stable PPP interface name per VPN:
+
+```ini
+# /etc/openfortivpn/hyd.conf
+pppd-ifname = ppp-hyd
+
+# /etc/openfortivpn/mum.conf
+pppd-ifname = ppp-mum
+
+# /etc/openfortivpn/vij.conf
+pppd-ifname = ppp-vij
+```
+
+This avoids depending on kernel-assigned names like `ppp0`, `ppp1`, and
+`ppp2`, which can change when services restart in a different order.
+
 ---
 
 # 4. Run VPNs with systemd
 
 Each VPN runs as its own service. This keeps the tunnels alive after SSH disconnects and lets systemd restart them after FortiGate session timeout.
+
+Install the route helper first:
+
+```bash
+sudo tee /usr/local/sbin/vpn-routes.sh >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+vpn="${1:-}"
+
+case "$vpn" in
+  hyd)
+    iface="ppp-hyd"
+    routes=("10.2.0.0/24")
+    ;;
+  mum)
+    iface="ppp-mum"
+    routes=("10.2.1.0/24")
+    ;;
+  vij)
+    iface="ppp-vij"
+    routes=("10.10.10.0/24")
+    ;;
+  *)
+    echo "usage: $0 {hyd|mum|vij}" >&2
+    exit 2
+    ;;
+esac
+
+last_error=""
+for _ in {1..90}; do
+  if ip link show "$iface" >/dev/null 2>&1; then
+    ok=1
+    for route in "${routes[@]}"; do
+      if out=$(ip route replace "$route" dev "$iface" 2>&1); then
+        echo "installed route $route dev $iface for $vpn"
+      else
+        ok=0
+        last_error="$out"
+        break
+      fi
+    done
+    if [ "$ok" -eq 1 ]; then
+      exit 0
+    fi
+  else
+    last_error="interface $iface not found"
+  fi
+  sleep 1
+done
+
+echo "failed to install routes for $vpn on $iface: $last_error" >&2
+exit 1
+EOF
+
+sudo chmod 755 /usr/local/sbin/vpn-routes.sh
+```
 
 Hyd:
 
@@ -116,6 +190,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/openfortivpn -c /etc/openfortivpn/hyd.conf
+ExecStartPost=/usr/local/sbin/vpn-routes.sh hyd
 Restart=always
 RestartSec=10
 
@@ -135,6 +210,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/openfortivpn -c /etc/openfortivpn/mum.conf
+ExecStartPost=/usr/local/sbin/vpn-routes.sh mum
 Restart=always
 RestartSec=10
 
@@ -154,6 +230,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/openfortivpn -c /etc/openfortivpn/vij.conf
+ExecStartPost=/usr/local/sbin/vpn-routes.sh vij
 Restart=always
 RestartSec=10
 
@@ -172,7 +249,7 @@ sudo systemctl enable --now openfortivpn-vij.service
 
 ---
 
-# 5. Discover VPN Interfaces
+# 5. Verify VPN Interfaces
 
 Check services:
 
@@ -185,15 +262,15 @@ systemctl status openfortivpn-vij.service
 Check PPP interfaces:
 
 ```bash
-ip addr | grep ppp
+ip -br addr | grep ppp
 ```
 
-Example:
+Expected on `ravi-vpn`:
 
 ```text
-ppp0 -> hyd
-ppp1 -> mum
-ppp2 -> vij
+ppp-hyd -> hyd
+ppp-mum -> mum
+ppp-vij -> vij
 ```
 
 Confirm from logs:
@@ -204,17 +281,9 @@ sudo journalctl -u openfortivpn-mum.service --no-pager | grep 'Using interface'
 sudo journalctl -u openfortivpn-vij.service --no-pager | grep 'Using interface'
 ```
 
-Current mapping on `ravi-vpn`:
-
-```text
-hyd -> ppp0
-mum -> ppp1
-vij -> ppp2
-```
-
 ---
 
-# 6. Add Routes Manually
+# 6. Persistent Routes
 
 Because:
 
@@ -222,7 +291,8 @@ Because:
 set-routes = 0
 ```
 
-Use `replace` instead of `add` so the commands are safe to rerun after service restarts.
+routes are installed by `/usr/local/sbin/vpn-routes.sh` from each service's
+`ExecStartPost`.
 
 ### vij
 
@@ -235,7 +305,7 @@ Need access:
 Add:
 
 ```bash
-sudo ip route replace 10.10.10.0/24 dev ppp2
+sudo /usr/local/sbin/vpn-routes.sh vij
 ```
 
 Verify:
@@ -247,7 +317,7 @@ ip route get 10.10.10.39
 Expected:
 
 ```text
-10.10.10.39 dev ppp2
+10.10.10.39 dev ppp-vij
 ```
 
 Test:
@@ -269,7 +339,7 @@ Need access:
 Add:
 
 ```bash
-sudo ip route replace 10.2.1.0/24 dev ppp1
+sudo /usr/local/sbin/vpn-routes.sh mum
 ```
 
 Verify:
@@ -281,7 +351,7 @@ ip route get 10.2.1.1
 Expected:
 
 ```text
-10.2.1.1 dev ppp1
+10.2.1.1 dev ppp-mum
 ```
 
 ---
@@ -300,7 +370,7 @@ Need access:
 Add:
 
 ```bash
-sudo ip route replace 10.2.0.0/24 dev ppp0
+sudo /usr/local/sbin/vpn-routes.sh hyd
 ```
 
 Verify:
@@ -312,7 +382,7 @@ ip route get 10.2.0.11
 Expected:
 
 ```text
-10.2.0.11 dev ppp0
+10.2.0.11 dev ppp-hyd
 ```
 
 Test:
@@ -464,20 +534,20 @@ tailscale ping <node>
 Add more VPNs:
 
 ```text
-ppp0 -> hyd
-ppp1 -> mum
-ppp2 -> vij
-ppp3 -> customer-a
+ppp-hyd        -> hyd
+ppp-mum        -> mum
+ppp-vij        -> vij
+ppp-customer-a -> customer-a
 tun0 -> gcp-openvpn
 ```
 
 Routes:
 
 ```bash
-10.2.0.0/24   -> ppp0
-10.2.1.0/24   -> ppp1
-10.10.10.0/24 -> ppp2
-10.5.0.0/16   -> ppp3
+10.2.0.0/24   -> ppp-hyd
+10.2.1.0/24   -> ppp-mum
+10.10.10.0/24 -> ppp-vij
+10.5.0.0/16   -> ppp-customer-a
 172.16.0.0/16 -> tun0
 ```
 
